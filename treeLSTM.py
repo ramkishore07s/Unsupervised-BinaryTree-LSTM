@@ -1,8 +1,7 @@
 
 # coding: utf-8
 
-# In[2]:
-
+# In[76]:
 
 import math
 
@@ -13,8 +12,7 @@ from torch.nn import init
 import basic
 
 
-# In[ ]:
-
+# In[6]:
 
 class BinaryTreeLSTMLayer(nn.Module):
 
@@ -53,106 +51,63 @@ class BinaryTreeLSTMLayer(nn.Module):
         return h, c
 
 
-# In[5]:
+# In[80]:
+
+def cosine_distance(hl, hr, hp):
+    # return cosine similarity
+    # add gumbell noise
+    return torch.div(torch.sum(hl * hr, 2).float(), 
+                     (torch.sqrt(torch.sum(hl * hl, 2).float()) * torch.sqrt(torch.sum(hr * hr, 2).float())))
 
 
-class BinaryTreeLSTM(nn.Module):
+# In[82]:
 
-    def __init__(self, word_dim, hidden_dim, use_leaf_rnn, intra_attention,
-                 gumbel_temperature, bidirectional):
-        super(BinaryTreeLSTM, self).__init__()
-        self.word_dim = word_dim
-        self.hidden_dim = hidden_dim
-        self.gumbel_temperature = gumbel_temperature
-        self.word_linear = nn.Linear(in_features=word_dim, out_features=2 * hidden_dim)
-        self.treelstm_layer = BinaryTreeLSTMLayer(hidden_dim)
-        self.comp_query = nn.Parameter(torch.FloatTensor(hidden_dim))
-
-        self.reset_parameters()
+class TreeLSTM(nn.Module):
+    def __init__(self, dim, gumbell_temperature=1.0, classifier=cosine_distance, training=False):
         
-    def reset_parameters(self):
-        self.treelstm_layer.reset_parameters()
-        init.normal_(self.comp_query.data, mean=0, std=0.01)
+        super(TreeLSTM, self).__init__()
+        self.dim = dim
+        self.gumbell_temperature = gumbell_temperature
+        self.compose_parent = BinaryTreeLSTMLayer(dim)
+        self.score = classifier
+        self.training = training
+
+
+# In[84]:
+
+def forward(self, input):
+    h, c = input
+    max_depth = h.size(1)
+    for i in range(max_depth - 1):
+        hl, hr = h[:, :-1, :], h[:, 1:, :]
+        cl, cr = c[:, :-1, :], c[:, 1:, :]
+        ph, pc = self.compose_parent((hl, cl), (hr, cr))
+
+        # Compute scores for all adjacent nodes
+        comp = self.score(hl, hr, ph)
+
+        # Get probabilities
+        if self.training: select_mask = basic.st_gumbel_softmax(comp, temperature=self.gumbell_temperature, mask=None)
+        else: select_mask = basic.greedy_select(logits=comp, mask=None).float()
         
-    @staticmethod
-    def update_state(old_state, new_state, done_mask):
-        old_h, old_c = old_state
-        new_h, new_c = new_state
-        done_mask = done_mask.float().unsqueeze(1).unsqueeze(2)
-        h = done_mask * new_h + (1 - done_mask) * old_h[:, :-1, :]
-        c = done_mask * new_c + (1 - done_mask) * old_c[:, :-1, :]
-        return h, c
-    
-    def select_composition(self, old_state, new_state, mask):
-        new_h, new_c = new_state
-        old_h, old_c = old_state
-        old_h_left, old_h_right = old_h[:, :-1, :], old_h[:, 1:, :]
-        old_c_left, old_c_right = old_c[:, :-1, :], old_c[:, 1:, :]
-        comp_weights = (self.comp_query * new_h).sum(-1)
-        comp_weights = comp_weights / math.sqrt(self.hidden_dim)
-        if self.training:
-            select_mask = basic.st_gumbel_softmax(
-                logits=comp_weights, temperature=self.gumbel_temperature,
-                mask=mask)
-        else:
-            select_mask = basic.greedy_select(logits=comp_weights, mask=mask)
-            select_mask = select_mask.float()
-        select_mask_expand = select_mask.unsqueeze(2).expand_as(new_h)
+        # Compose binary masks based on probabilities
+        select_mask_expanded = select_mask.unsqueeze(2).expand_as(hl)
         select_mask_cumsum = select_mask.cumsum(1)
-        left_mask = 1 - select_mask_cumsum
-        left_mask_expand = left_mask.unsqueeze(2).expand_as(old_h_left)
-        right_mask = select_mask_cumsum - select_mask
-        right_mask_expand = right_mask.unsqueeze(2).expand_as(old_h_right)
-        new_h = (select_mask_expand * new_h
-                 + left_mask_expand * old_h_left
-                 + right_mask_expand * old_h_right)
-        new_c = (select_mask_expand * new_c
-                 + left_mask_expand * old_c_left
-                 + right_mask_expand * old_c_right)
-        selected_h = (select_mask_expand * new_h).sum(1)
-        return new_h, new_c, select_mask, selected_h
-    
-    def forward(self, input, length, return_select_masks=False):
-        max_depth = input.size(1)
-        length_mask = basic.sequence_mask(sequence_length=length,
-                                          max_length=max_depth)
-        select_masks = []
+        left_mask_expanded = (1 - select_mask_cumsum).unsqueeze(2).expand_as(hl)
+        right_mask_expanded = (select_mask_cumsum - select_mask).unsqueeze(2).expand_as(hl)
         
-        state = self.word_linear(input)
-        state = state.chunk(chunks=2, dim=2)
-        nodes = []
-        for i in range(max_depth - 1):
-            h, c = state
-            l = (h[:, :-1, :], c[:, :-1, :])
-            r = (h[:, 1:, :], c[:, 1:, :])
-            new_state = self.treelstm_layer(l=l, r=r)
-            if i < max_depth - 2:
-                # We don't need to greedily select the composition in the
-                # last iteration, since it has only one option left.
-                new_h, new_c, select_mask, selected_h = self.select_composition(
-                    old_state=state, new_state=new_state,
-                    mask=length_mask[:, i+1:])
-                new_state = (new_h, new_c)
-                select_masks.append(select_mask)
-            done_mask = length_mask[:, i+1]
-            state = self.update_state(old_state=state, new_state=new_state,
-                                      done_mask=done_mask)
-        h, c = state
-
-        if not return_select_masks:
-            return h.squeeze(1), c.squeeze(1)
-        else:
-            return h.squeeze(1), c.squeeze(1), select_masks
+        # Combine most probable nodes
+        h = (select_mask_expanded * ph
+             + left_mask_expanded * hl
+             + right_mask_expanded * hr)
+        c = (select_mask_expanded * pc
+             + left_mask_expanded * cl
+             + right_mask_expanded * cr)
+            
+    return h.squeeze(1), c.squeeze(1)
 
 
-# In[7]:
+# In[ ]:
 
-
-torch.cuda.set_device(1)
-
-
-# In[8]:
-
-
-a = torch.cuda.FloatTensor([[1,2,3],[2,3,4]])
+TreeLSTM.forward = forward
 

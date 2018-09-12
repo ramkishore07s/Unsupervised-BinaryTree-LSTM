@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+test.ipynb
+treelstm.py
 
 # C extensions
 *.so
